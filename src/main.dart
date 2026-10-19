@@ -58,8 +58,11 @@ class CarTelemetry {
   double speedRR = 0.0;
 
   double cvtTemp = 0.0;
+  int cvtRawAdc = 0;
 
-  String awdMode = "AUTO";
+  String awdMode = "2WD";
+  int awdByte21 = 0;
+  int awdByte28 = 0;
   int awdTorqueSplitRear = 0;
   double awdSolenoidCurrent = 0.0;
 
@@ -71,13 +74,16 @@ class CarTelemetry {
 
   String lastRawAbs = "Нет данных";
   String lastRawAwd = "Нет данных";
-  String lastRawCvt = "Нет данных";
+  String lastRawCvt1 = "Нет данных";
+  String lastRawCvt2 = "Нет данных";
+
   List<int> lastBytesAbs = [];
   List<int> lastBytesAwd = [];
-  List<int> prevBytesAwd = [];
-  List<int> lastBytesCvt = [];
-  String activeAbsCommand = "Поиск...";
-  String activeCvtCommand = "2101 (c 10C0)";
+  List<int> baselineBytesAwd = []; // Снимок на стоячей машине для поиска байтов движения
+  List<int> lastBytesCvt1 = [];
+  List<int> lastBytesCvt2 = [];
+
+  String liveMovingBytesHint = "Стоим на месте (нажми Сброс базы и тронься)";
 
   int txCount = 0;
   int rxCount = 0;
@@ -106,11 +112,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String _rxBuffer = "";
   String _currentTargetEcu = "ELM";
   Completer<String>? _cmdCompleter;
-
-  // Список кандидатов-команд для блока ABS (так как 2101 дал 7F2112, а 221101 дал 7F2211)
-  final List<String> _absCandidateCmds = ["2102", "2103", "2104", "2110", "2120", "2105"];
-  int _absCandidateIdx = 0;
-  String? _workingAbsCmd;
 
   final Map<String, double> _tpmsAccumulator = {'FL': 0.0, 'FR': 0.0, 'RL': 0.0, 'RR': 0.0};
   int _tpmsSamplesCount = 0;
@@ -267,7 +268,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       _demoTimer?.cancel();
       _isPollingLoopRunning = false;
-      _workingAbsCmd = null;
 
       _addDevLog("SYS", "BT", "Подключение к ${selectedDevice.name} (${selectedDevice.address})...");
       _connection = await BluetoothConnection.toAddress(selectedDevice.address);
@@ -375,7 +375,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
     await _sendAndWait("AT FCSM 1", ecuTag: ecuTag);
   }
 
-  // ==================== ПОСЛЕДОВАТЕЛЬНЫЙ ЦИКЛ ОПРОСА БЛОКОВ v3 ====================
+  // Проверка, является ли ответ реальным отказом CAN (7F в начале, а не внутри данных!)
+  bool _isNegativeResponse(String raw) {
+    final clean = raw.trim().toUpperCase();
+    if (clean.isEmpty || clean.contains("NO DATA") || clean.contains("ERROR") || clean.contains("TIMEOUT")) {
+      return true;
+    }
+    return clean.startsWith("7F");
+  }
+
+  // ==================== ПОСЛЕДОВАТЕЛЬНЫЙ ЦИКЛ ОПРОСА БЛОКОВ v4 ====================
 
   Future<void> _runSequentialCanLoop() async {
     if (_isPollingLoopRunning) return;
@@ -387,50 +396,32 @@ class _DashboardScreenState extends State<DashboardScreen> {
         continue;
       }
 
-      // 1. БЛОК ПОЛНОГО ПРИВОДА 4WD (743 -> 763) — стабильно отдает 104 байта!
+      // 1. БЛОК ПОЛНОГО ПРИВОДА 4WD (743 -> 763)
       await _selectEcu("743", "763", "4WD");
       final String awdResp = await _sendAndWait("2101", ecuTag: "4WD");
       _parseMultiFrameResponse(awdResp, "4WD");
 
       if (!_isConnected || !_isPollingLoopRunning) break;
 
-      // 2. БЛОК ВАРИАТОРА JF011E (7E1 -> 7E9)
-      // Исправление ошибки 7F 21 80: сначала открываем сессию 10C0!
-      await _selectEcu("7E1", "7E9", "CVT");
-      await _sendAndWait("10C0", ecuTag: "CVT");
-      String cvtResp = await _sendAndWait("2101", ecuTag: "CVT");
-      if (cvtResp.contains("7F")) {
-        // Если 2101 все еще закрыт, пробуем 2102 или чтение через OBD-режим
-        _telemetry.activeCvtCommand = "2102 (c 10C0)";
-        cvtResp = await _sendAndWait("2102", ecuTag: "CVT");
-      } else {
-        _telemetry.activeCvtCommand = "2101 (c 10C0)";
-      }
-      _parseMultiFrameResponse(cvtResp, "CVT");
+      // 2. БЛОК ABS / VDC (НАСТОЯЩИЙ АДРЕС NISSAN T31: 742 -> 762!)
+      await _selectEcu("742", "762", "ABS");
+      await _sendAndWait("10C0", ecuTag: "ABS");
+      final String absResp = await _sendAndWait("2101", ecuTag: "ABS");
+      _parseMultiFrameResponse(absResp, "ABS");
 
       if (!_isConnected || !_isPollingLoopRunning) break;
 
-      // 3. БЛОК ABS (740 -> 760) — автопоиск рабочей группы 21 XX
-      await _selectEcu("740", "760", "ABS");
-      await _sendAndWait("10C0", ecuTag: "ABS");
-      final String cmdToTry = _workingAbsCmd ?? _absCandidateCmds[_absCandidateIdx];
-      _telemetry.activeAbsCommand = cmdToTry;
-      final String absResp = await _sendAndWait(cmdToTry, ecuTag: "ABS");
+      // 3. БЛОК ВАРИАТОРА JF011E (7E1 -> 7E9)
+      // Читаем оба пакета (2101 и 2102), НЕ путая байт 7F внутри данных с ошибкой!
+      await _selectEcu("7E1", "7E9", "CVT");
+      await _sendAndWait("10C0", ecuTag: "CVT");
+      final String cvt1Resp = await _sendAndWait("2101", ecuTag: "CVT");
+      _parseMultiFrameResponse(cvt1Resp, "CVT1");
 
-      if (!absResp.contains("7F") && !absResp.contains("NO DATA") && absResp.contains("61")) {
-        // Нашли рабочую команду ABS! Фиксируем её
-        _workingAbsCmd = cmdToTry;
-        _parseMultiFrameResponse(absResp, "ABS");
-      } else {
-        // Переключаем кандидата на следующий цикл
-        _telemetry.errCount++;
-        setState(() {
-          _telemetry.lastRawAbs = "$cmdToTry -> $absResp";
-        });
-        _absCandidateIdx = (_absCandidateIdx + 1) % _absCandidateCmds.length;
-      }
+      final String cvt2Resp = await _sendAndWait("2102", ecuTag: "CVT");
+      _parseMultiFrameResponse(cvt2Resp, "CVT2");
 
-      await Future.delayed(const Duration(milliseconds: 30));
+      await Future.delayed(const Duration(milliseconds: 25));
     }
   }
 
@@ -450,12 +441,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   void _parseMultiFrameResponse(String rawStr, String ecuTag) {
-    if (rawStr.isEmpty) return;
-    if (rawStr.contains("NO DATA") || rawStr.contains("ERROR") || rawStr.contains("7F")) {
+    if (_isNegativeResponse(rawStr)) {
       _telemetry.errCount++;
       setState(() {
         if (ecuTag == "4WD") _telemetry.lastRawAwd = rawStr;
-        if (ecuTag == "CVT") _telemetry.lastRawCvt = rawStr;
+        if (ecuTag == "CVT1") _telemetry.lastRawCvt1 = rawStr;
+        if (ecuTag == "CVT2") _telemetry.lastRawCvt2 = rawStr;
         if (ecuTag == "ABS") _telemetry.lastRawAbs = rawStr;
       });
       return;
@@ -464,7 +455,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final String cleanHex = _stripIsoTpFraming(rawStr);
     final List<int> bytes = _hexToBytes(cleanHex);
 
-    // Ищем позитивный заголовок ответа 0x61 (ответ на сервис 21)
     int startIdx = -1;
     for (int i = 0; i < bytes.length - 1; i++) {
       if (bytes[i] == 0x61) {
@@ -479,15 +469,19 @@ class _DashboardScreenState extends State<DashboardScreen> {
     setState(() {
       if (ecuTag == "4WD") {
         _telemetry.lastRawAwd = rawStr;
-        if (_telemetry.lastBytesAwd.isNotEmpty) {
-          _telemetry.prevBytesAwd = List<int>.from(_telemetry.lastBytesAwd);
+        if (_telemetry.baselineBytesAwd.isEmpty) {
+          _telemetry.baselineBytesAwd = List<int>.from(payload);
         }
         _telemetry.lastBytesAwd = payload;
         _parseAwdData(payload);
-      } else if (ecuTag == "CVT") {
-        _telemetry.lastRawCvt = rawStr;
-        _telemetry.lastBytesCvt = payload;
-        _parseCvtData(payload);
+      } else if (ecuTag == "CVT1") {
+        _telemetry.lastRawCvt1 = rawStr;
+        _telemetry.lastBytesCvt1 = payload;
+        _parseCvt1Data(payload);
+      } else if (ecuTag == "CVT2") {
+        _telemetry.lastRawCvt2 = rawStr;
+        _telemetry.lastBytesCvt2 = payload;
+        _parseCvt2Data(payload);
       } else if (ecuTag == "ABS") {
         _telemetry.lastRawAbs = rawStr;
         _telemetry.lastBytesAbs = payload;
@@ -497,37 +491,57 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
-  // Парсинг 104-байтного пакета 4WD (743 -> 763), адаптированный под реальный дамп T31
+  // Парсинг 104-байтного пакета 4WD (743 -> 763)
   void _parseAwdData(List<int> b) {
     if (b.length < 40) return;
 
-    // Если блок ABS еще ищет команду, берем скорости колес прямо из первых байтов 4WD (байты 2..5 или 2..9)
-    if (_workingAbsCmd == null) {
-      // В стоячем положении на твоем логе байты [2]..[8] строго равны 00
+    // 1. Определение режима шайбы 4WD по найденному тобой 21-му байту!
+    _telemetry.awdByte21 = b[21];
+    _telemetry.awdByte28 = b[28];
+
+    if (b[21] == 0x20 || b[21] == 20) {
+      _telemetry.awdMode = "LOCK";
+    } else if (b[28] == 0x04 && b[21] == 0x00) {
+      // Если шайба в 2WD или AUTO — смотрим бит авторежима
+      _telemetry.awdMode = (b[32] == 0x01) ? "2WD / AUTO" : "2WD";
+    } else {
+      _telemetry.awdMode = "AUTO";
+    }
+
+    // 2. Охотник за изменившимися байтами относительно стоячей машины (поможет увидеть скорости и муфту)
+    if (_telemetry.baselineBytesAwd.length == b.length) {
+      List<String> changed = [];
+      for (int i = 2; i < min(45, b.length); i++) {
+        // Игнорируем шум младшего байта G-сенсора [13]
+        if (i == 13) continue;
+        int diff = (b[i] - _telemetry.baselineBytesAwd[i]).abs();
+        if (diff > 0) {
+          final hexVal = b[i].toRadixString(16).toUpperCase().padLeft(2, '0');
+          changed.add("[$i]:$hexVal(${b[i]})");
+        }
+      }
+      _telemetry.liveMovingBytesHint =
+          changed.isEmpty ? "Изменений нет (стоянка)" : "Активные байты 4WD: ${changed.join('  ')}";
+    }
+
+    // 3. Если блок ABS 742 еще не прислал скорости, берем только [2],[3],[4],[5] (без [6]!)
+    if (_telemetry.lastBytesAbs.isEmpty) {
       _telemetry.speedFL = b[2].toDouble();
       _telemetry.speedFR = b[3].toDouble();
       _telemetry.speedRL = b[4].toDouble();
       _telemetry.speedRR = b[5].toDouble();
     }
 
-    // Байт [28] в твоем дампе равен 0x04 (битовая маска режима шайбы 4WD)
-    int modeFlags = b[28];
-    if (modeFlags == 0x02 || modeFlags == 0x01) {
-      _telemetry.awdMode = "2WD";
-    } else if (modeFlags >= 0x08) {
-      _telemetry.awdMode = "LOCK";
-    } else {
-      _telemetry.awdMode = "AUTO";
-    }
-
-    // Ток муфты / процент блокировки (в стоячем положении байты [6..7] = 00 00)
-    int rawTorque = b[6];
-    _telemetry.awdTorqueSplitRear = rawTorque.clamp(0, 50);
+    // 4. Ток соленоида муфты (байт [16] или [17] — на стоячей машине равен 00)
+    int rawDuty = b[16];
+    _telemetry.awdTorqueSplitRear = rawDuty.clamp(0, 50);
     _telemetry.awdSolenoidCurrent = (_telemetry.awdTorqueSplitRear / 50.0) * 2.8;
   }
 
+  // Парсинг пакета ABS/VDC (742 -> 762, ответ 61 01 ...)
   void _parseAbsPackage(List<int> b) {
     if (b.length >= 10) {
+      // На блоках ABS 742 Nissan скорости колес идут с 2-го по 9-й байт
       _telemetry.speedFL = ((b[2] << 8) + b[3]) / 100.0;
       _telemetry.speedFR = ((b[4] << 8) + b[5]) / 100.0;
       _telemetry.speedRL = ((b[6] << 8) + b[7]) / 100.0;
@@ -535,13 +549,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  void _parseCvtData(List<int> b) {
-    // В пакете 61 01 от Jatco JF011E проверяем стандартные смещения температуры
+  // Парсинг температуры вариатора из пакета 61 01 (по твоему логу: байт [10] = 0xAD = 173, байт [11] = 0xB1 = 177)
+  void _parseCvt1Data(List<int> b) {
     if (b.length >= 12) {
-      int rawTemp = b[10];
-      _telemetry.cvtTemp = (rawTemp - 50).toDouble();
-    } else if (b.length >= 5) {
-      _telemetry.cvtTemp = (b[4] - 50).toDouble();
+      int rawAdc = b[10]; // В твоем логе на прогретой машине тут стабильно 0xAD (173)
+      _telemetry.cvtRawAdc = rawAdc;
+      if (rawAdc > 0) {
+        // Конвертация отсчетов терморезистора Jatco JF011E (при 173 отсчетах температура около 73..78°C)
+        _telemetry.cvtTemp = (rawAdc - 95).toDouble();
+      }
+    }
+  }
+
+  // Дополнительное уточнение по пакету 61 02
+  void _parseCvt2Data(List<int> b) {
+    if (_telemetry.cvtRawAdc == 0 && b.length >= 29) {
+      // В твоем логе 61 02 байты [27]=84, [28]=87
+      _telemetry.cvtTemp = b[27].toDouble();
     }
   }
 
@@ -623,8 +647,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
           _telemetry.speedRR = 60.45;
           _telemetry.speedFR = 60.0;
           _telemetry.speedFL = simulateSlip ? 68.5 : 60.0;
-          _telemetry.cvtTemp = 82.0;
-          _telemetry.awdMode = "AUTO";
+          _telemetry.cvtTemp = 78.0;
+          _telemetry.awdMode = simulateSlip ? "LOCK" : "AUTO";
           _telemetry.awdTorqueSplitRear = simulateSlip ? 45 : 5;
           _telemetry.awdSolenoidCurrent = simulateSlip ? 2.4 : 0.2;
           _calculateSlipAndVirtualTpms();
@@ -635,18 +659,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  void _resetTpmsCalibration() {
+  void _resetBaselineAndTpms() {
     setState(() {
       _tpmsSamplesCount = 0;
       _tpmsAccumulator.updateAll((key, value) => 0.0);
       _telemetry.tpmsStatus.updateAll((key, value) => 'OK');
       _telemetry.tpmsDeviation.updateAll((key, value) => 0.0);
+      if (_telemetry.lastBytesAwd.isNotEmpty) {
+        _telemetry.baselineBytesAwd = List<int>.from(_telemetry.lastBytesAwd);
+      }
+      _telemetry.liveMovingBytesHint = "База стоянки зафиксирована! Начни движение...";
     });
-    _showPopupAlert(
-      "Калибровка TPMS сброшена",
-      "Текущие радиусы качения всех 4 колес приняты за эталон.",
-      isError: false,
-    );
   }
 
   void _openDeveloperMenu() {
@@ -691,7 +714,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
             ),
             Text(
-              'by denmov (v3)',
+              'by denmov (v4)',
               style: TextStyle(
                 fontSize: 11,
                 color: Colors.cyanAccent,
@@ -707,9 +730,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
             onPressed: _openDeveloperMenu,
           ),
           IconButton(
-            tooltip: 'Сброс калибровки TPMS',
-            icon: const Icon(Icons.tire_repair),
-            onPressed: _resetTpmsCalibration,
+            tooltip: 'Зафиксировать базу стоянки / Сброс TPMS',
+            icon: const Icon(Icons.my_location, color: Colors.cyanAccent),
+            onPressed: _resetBaselineAndTpms,
           ),
           IconButton(
             tooltip: 'Демо-режим',
@@ -740,8 +763,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 Expanded(child: _buildAwdCard()),
               ],
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             Expanded(child: _buildChassisMonitor()),
+            const SizedBox(height: 8),
+            // Информационная строка Охотника за байтами (показывает, какие байты меняются при езде)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1A1F29),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.white12),
+              ),
+              child: Text(
+                _telemetry.liveMovingBytesHint,
+                style: const TextStyle(
+                  fontFamily: 'monospace',
+                  fontSize: 11,
+                  color: Colors.amberAccent,
+                ),
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
           ],
         ),
       ),
@@ -756,7 +800,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       tempState = "ХОЛОДНЫЙ (Прогрев)";
     } else if (_telemetry.cvtTemp >= 90 && _telemetry.cvtTemp < 105) {
       tempColor = Colors.orangeAccent;
-      tempState = "НАГРЕВ (Счетчик > 90°C)";
+      tempState = "НАГРЕВ (> 90°C)";
     } else if (_telemetry.cvtTemp >= 105) {
       tempColor = Colors.redAccent;
       tempState = "ПЕРЕГРЕВ!";
@@ -769,9 +813,18 @@ class _DashboardScreenState extends State<DashboardScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
-              "ВАРИАТОР (CVT)",
-              style: TextStyle(fontSize: 12, color: Colors.white60, fontWeight: FontWeight.bold),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  "ВАРИАТОР (CVT)",
+                  style: TextStyle(fontSize: 12, color: Colors.white60, fontWeight: FontWeight.bold),
+                ),
+                Text(
+                  "ADC:${_telemetry.cvtRawAdc}",
+                  style: const TextStyle(fontSize: 10, color: Colors.white38),
+                ),
+              ],
             ),
             const SizedBox(height: 6),
             Text(
@@ -837,8 +890,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
             const SizedBox(height: 4),
             Text(
-              "Муфта: ${_telemetry.awdSolenoidCurrent.toStringAsFixed(2)} А",
-              style: const TextStyle(fontSize: 11, color: Colors.white54),
+              "Муфта: ${_telemetry.awdSolenoidCurrent.toStringAsFixed(2)}А | b21:${_telemetry.awdByte21.toRadixString(16).toUpperCase()}",
+              style: const TextStyle(fontSize: 10, color: Colors.white54),
             ),
           ],
         ),
@@ -854,10 +907,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
         child: Column(
           children: [
             const Text(
-              "КОНТРОЛЬ ПРОБУКСОВКИ & ВИРТУАЛЬНЫЙ TPMS (ABS)",
+              "КОНТРОЛЬ ПРОБУКСОВКИ & ВИРТУАЛЬНЫЙ TPMS (ABS 742)",
               style: TextStyle(fontSize: 12, color: Colors.white60, fontWeight: FontWeight.bold),
             ),
-            const SizedBox(height: 16),
+            const SizedBox(height: 12),
             Expanded(
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -873,7 +926,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
                       const Icon(Icons.keyboard_double_arrow_up, color: Colors.white30, size: 28),
-                      Container(width: 6, height: 80, color: Colors.white24),
+                      Container(width: 6, height: 70, color: Colors.white24),
                       Container(
                         padding: const EdgeInsets.all(8),
                         decoration: BoxDecoration(
@@ -893,7 +946,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ),
                       Container(
                         width: 6,
-                        height: 60,
+                        height: 55,
                         color: _telemetry.awdTorqueSplitRear > 5 ? Colors.amber : Colors.white24,
                       ),
                     ],
@@ -982,7 +1035,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 }
 
-// ==================== ЭКРАН МЕНЮ РАЗРАБОТЧИКА v3 ====================
+// ==================== ЭКРАН МЕНЮ РАЗРАБОТЧИКА v4 ====================
 
 class DeveloperMenuScreen extends StatefulWidget {
   final CarTelemetry telemetry;
@@ -1025,31 +1078,20 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
     super.dispose();
   }
 
-  String _formatDiffAwdBytes() {
-    final cur = widget.telemetry.lastBytesAwd;
-    final prev = widget.telemetry.prevBytesAwd;
-    if (cur.isEmpty || prev.isEmpty || cur.length != prev.length) return "Нет изменений";
-    List<String> diffs = [];
-    for (int i = 0; i < cur.length; i++) {
-      if (cur[i] != prev[i]) {
-        diffs.add("[$i]: ${prev[i].toRadixString(16).toUpperCase()}->${cur[i].toRadixString(16).toUpperCase()}");
-      }
-    }
-    return diffs.isEmpty ? "Стабильно" : diffs.join(", ");
-  }
-
   void _copyAllTelemetryReport() {
     final StringBuffer sb = StringBuffer();
-    sb.writeln("=== X-TRAIL T31 DIAGNOSTIC REPORT v3 (by denmov) ===");
+    sb.writeln("=== X-TRAIL T31 DIAGNOSTIC REPORT v4 (by denmov) ===");
     sb.writeln("TX: ${widget.telemetry.txCount} | RX: ${widget.telemetry.rxCount} | ERR: ${widget.telemetry.errCount}");
+    sb.writeln("MOVING HINT: ${widget.telemetry.liveMovingBytesHint}");
     sb.writeln("\n--- СНИМКИ БЛОКОВ (RAW HEX) ---");
-    sb.writeln("ABS (${widget.telemetry.activeAbsCommand}): ${widget.telemetry.lastRawAbs}");
+    sb.writeln("ABS (742->762): ${widget.telemetry.lastRawAbs}");
     sb.writeln("ABS BYTES: ${_formatIndexedBytes(widget.telemetry.lastBytesAbs)}");
     sb.writeln("4WD (743->763): ${widget.telemetry.lastRawAwd}");
-    sb.writeln("4WD DIFF: ${_formatDiffAwdBytes()}");
     sb.writeln("4WD BYTES: ${_formatIndexedBytes(widget.telemetry.lastBytesAwd)}");
-    sb.writeln("CVT (${widget.telemetry.activeCvtCommand}): ${widget.telemetry.lastRawCvt}");
-    sb.writeln("CVT BYTES: ${_formatIndexedBytes(widget.telemetry.lastBytesCvt)}");
+    sb.writeln("CVT 2101 (7E1->7E9): ${widget.telemetry.lastRawCvt1}");
+    sb.writeln("CVT 2101 BYTES: ${_formatIndexedBytes(widget.telemetry.lastBytesCvt1)}");
+    sb.writeln("CVT 2102 (7E1->7E9): ${widget.telemetry.lastRawCvt2}");
+    sb.writeln("CVT 2102 BYTES: ${_formatIndexedBytes(widget.telemetry.lastBytesCvt2)}");
     sb.writeln("\n--- ПОСЛЕДНИЕ 60 СТРОК ЛОГА ---");
     for (final entry in widget.logs.take(60)) {
       sb.writeln(entry.toString());
@@ -1058,7 +1100,7 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
     Clipboard.setData(ClipboardData(text: sb.toString()));
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text("Полный отчет разработчика v3 скопирован в буфер!"),
+        content: Text("Полный отчет разработчика v4 скопирован в буфер!"),
         duration: Duration(seconds: 2),
       ),
     );
@@ -1079,7 +1121,7 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
     return Scaffold(
       appBar: AppBar(
         backgroundColor: const Color(0xFF1A1F29),
-        title: const Text("Меню разработчика v3", style: TextStyle(fontSize: 16)),
+        title: const Text("Меню разработчика v4", style: TextStyle(fontSize: 16)),
         actions: [
           IconButton(
             tooltip: "Скопировать весь отчет для Gemini",
@@ -1130,38 +1172,38 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
               children: [
                 _buildCounterItem("Отправлено (TX)", widget.telemetry.txCount, Colors.cyanAccent),
                 _buildCounterItem("Принято (RX)", widget.telemetry.rxCount, Colors.greenAccent),
-                _buildCounterItem("Ошибки/7F", widget.telemetry.errCount, Colors.redAccent),
+                _buildCounterItem("Отказы (7F)", widget.telemetry.errCount, Colors.redAccent),
               ],
             ),
           ),
         ),
         const SizedBox(height: 8),
         _buildEcuDebugCard(
-          title: "Вариатор Jatco JF011E (7E1 -> 7E9) | ${widget.telemetry.activeCvtCommand}",
-          rawHex: widget.telemetry.lastRawCvt,
-          indexedBytes: _formatIndexedBytes(widget.telemetry.lastBytesCvt),
-          parsedSummary: "Температура CVT: ${widget.telemetry.cvtTemp} °C",
-          formulaNote: "Добавлена сессия 10C0 перед 2101 для снятия блокировки 7F 21 80.",
-        ),
-        const SizedBox(height: 8),
-        _buildEcuDebugCard(
-          title: "Блок 4WD (743 -> 763) | Пакет 104 байта OK!",
-          rawHex: widget.telemetry.lastRawAwd,
-          indexedBytes: _formatIndexedBytes(widget.telemetry.lastBytesAwd),
-          parsedSummary:
-              "Режим: ${widget.telemetry.awdMode} | Момент назад: ${widget.telemetry.awdTorqueSplitRear}%\n"
-              "Изменившиеся байты: ${_formatDiffAwdBytes()}",
-          formulaNote: "Поверни шайбу 2WD/AUTO/LOCK и посмотри в строку 'Изменившиеся байты'.",
-        ),
-        const SizedBox(height: 8),
-        _buildEcuDebugCard(
-          title: "Блок ABS (740 -> 760) | Автопоиск: ${widget.telemetry.activeAbsCommand}",
+          title: "Блок ABS / VDC (НОВЫЙ АДРЕС: 742 -> 762) | 2101",
           rawHex: widget.telemetry.lastRawAbs,
           indexedBytes: _formatIndexedBytes(widget.telemetry.lastBytesAbs),
           parsedSummary:
               "FL: ${widget.telemetry.speedFL} км/ч | FR: ${widget.telemetry.speedFR} км/ч\n"
               "RL: ${widget.telemetry.speedRL} км/ч | RR: ${widget.telemetry.speedRR} км/ч",
-          formulaNote: "Перебирает группы 2102, 2103, 2104, 2110, 2120.",
+          formulaNote: "Настоящий CAN ID блока ABS/ESP Nissan T31: 742 (ответ 762).",
+        ),
+        const SizedBox(height: 8),
+        _buildEcuDebugCard(
+          title: "Блок 4WD (743 -> 763) | Байт [21] = LOCK",
+          rawHex: widget.telemetry.lastRawAwd,
+          indexedBytes: _formatIndexedBytes(widget.telemetry.lastBytesAwd),
+          parsedSummary:
+              "Режим: ${widget.telemetry.awdMode} (b21=${widget.telemetry.awdByte21.toRadixString(16)})\n"
+              "${widget.telemetry.liveMovingBytesHint}",
+          formulaNote: "Когда поедешь, в строке 'Активные байты 4WD' появятся индексы скоростей и муфты.",
+        ),
+        const SizedBox(height: 8),
+        _buildEcuDebugCard(
+          title: "Вариатор Jatco JF011E (7E1 -> 7E9) | Пакет 2101",
+          rawHex: widget.telemetry.lastRawCvt1,
+          indexedBytes: _formatIndexedBytes(widget.telemetry.lastBytesCvt1),
+          parsedSummary: "Температура CVT: ${widget.telemetry.cvtTemp} °C (ADC [10]: ${widget.telemetry.cvtRawAdc})",
+          formulaNote: "Исправлен баг с 7F внутри данных! Читается стабильно.",
         ),
       ],
     );
@@ -1293,12 +1335,11 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
             spacing: 8,
             runSpacing: 8,
             children: [
+              _buildQuickCmdChip("ABS 742 (AT SH 742)", "AT SH 742"),
+              _buildQuickCmdChip("RX 762 (AT CRA 762)", "AT CRA 762"),
               _buildQuickCmdChip("Сессия 10C0", "10C0"),
               _buildQuickCmdChip("Запрос 2101", "2101"),
               _buildQuickCmdChip("Запрос 2102", "2102"),
-              _buildQuickCmdChip("Запрос 2103", "2103"),
-              _buildQuickCmdChip("Запрос 2110", "2110"),
-              _buildQuickCmdChip("Напряжение (AT RV)", "AT RV"),
             ],
           ),
           const SizedBox(height: 12),
@@ -1308,7 +1349,7 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
                 child: TextField(
                   controller: _cmdController,
                   decoration: const InputDecoration(
-                    hintText: "Введите команду (например: 2102)",
+                    hintText: "Введите команду (например: 2101)",
                     border: OutlineInputBorder(),
                     isDense: true,
                   ),
