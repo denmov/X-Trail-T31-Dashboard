@@ -28,11 +28,10 @@ class XTrailT31DashboardApp extends StatelessWidget {
   }
 }
 
-// Запись в журнале разработчика
 class DevLogEntry {
   final DateTime timestamp;
-  final String direction; // "TX", "RX", "SYS", "ERR"
-  final String ecu;       // "ABS", "4WD", "CVT", "ELM"
+  final String direction;
+  final String ecu;
   final String message;
 
   DevLogEntry({
@@ -52,7 +51,6 @@ class DevLogEntry {
   String toString() => "[$formattedTime] [$ecu] $direction: $message";
 }
 
-// Модель данных состояния автомобиля и отладочных снимков
 class CarTelemetry {
   double speedFL = 0.0;
   double speedFR = 0.0;
@@ -69,9 +67,8 @@ class CarTelemetry {
   Map<String, double> slipRatio = {'FL': 0.0, 'FR': 0.0, 'RL': 0.0, 'RR': 0.0};
 
   Map<String, String> tpmsStatus = {'FL': 'OK', 'FR': 'OK', 'RL': 'OK', 'RR': 'OK'};
-  Map<String, double> tpmsDeviation = {'FL': 0.0, 'FR': 0.0, 'RL': 0.0, 'RR': 0.0};
+  Map<String, double> tpmsDeviation = {'FL': 0.0, 'FR': 0.0, 'RL': 'OK' == 'OK' ? 0.0 : 0.0, 'RR': 0.0};
 
-  // Отладочные данные для Меню Разработчика
   String lastRawAbs = "Нет данных";
   String lastRawAwd = "Нет данных";
   String lastRawCvt = "Нет данных";
@@ -94,16 +91,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
   BluetoothConnection? _connection;
   bool _isConnected = false;
   bool _isDemoMode = false;
+  bool _isPollingLoopRunning = false;
   bool _pausePollingForManualCmd = false;
 
   final CarTelemetry _telemetry = CarTelemetry();
   final List<DevLogEntry> _devLogs = [];
   final ValueNotifier<int> _logNotifier = ValueNotifier<int>(0);
 
-  Timer? _pollingTimer;
-  int _pollStep = 0;
+  Timer? _demoTimer;
   String _rxBuffer = "";
   String _currentTargetEcu = "ELM";
+  Completer<String>? _cmdCompleter;
 
   final Map<String, double> _tpmsAccumulator = {'FL': 0.0, 'FR': 0.0, 'RL': 0.0, 'RR': 0.0};
   int _tpmsSamplesCount = 0;
@@ -116,7 +114,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   void dispose() {
-    _pollingTimer?.cancel();
+    _isPollingLoopRunning = false;
+    _demoTimer?.cancel();
     _connection?.dispose();
     _logNotifier.dispose();
     super.dispose();
@@ -131,7 +130,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     ].request();
   }
 
-  // Добавление строки в журнал разработчика
   void _addDevLog(String direction, String ecu, String message) {
     _devLogs.insert(
       0,
@@ -142,7 +140,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         message: message,
       ),
     );
-    if (_devLogs.length > 300) {
+    if (_devLogs.length > 400) {
       _devLogs.removeLast();
     }
     _logNotifier.value++;
@@ -220,7 +218,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  // ==================== ПОДКЛЮЧЕНИЕ И ИНИЦИАЛИЗАЦИЯ ELM327 ====================
+  // ==================== ПОДКЛЮЧЕНИЕ И СТРОГАЯ СИНХРОННАЯ ОЧЕРЕДЬ ELM327 ====================
 
   Future<void> _connectToElm() async {
     try {
@@ -233,7 +231,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       if (devices.isEmpty) {
         _showPopupAlert(
           "Нет спаренных устройств",
-          "Сначала выполните сопряжение с адаптером ELM327 в настройках Bluetooth телефона (обычно PIN 1234 или 0000), а также проверьте разрешение «Устройства поблизости».",
+          "Сначала выполните сопряжение с адаптером ELM327 в настройках Bluetooth телефона (обычно PIN 1234 или 0000).",
           isError: false,
         );
         return;
@@ -258,6 +256,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       if (selectedDevice == null) return;
 
+      _demoTimer?.cancel();
+      _isPollingLoopRunning = false;
+
       _addDevLog("SYS", "BT", "Подключение к ${selectedDevice.name} (${selectedDevice.address})...");
       _connection = await BluetoothConnection.toAddress(selectedDevice.address);
 
@@ -265,13 +266,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _isConnected = true;
         _isDemoMode = false;
       });
-      _addDevLog("SYS", "BT", "Успешно подключено! Инициализация ELM327...");
+      _addDevLog("SYS", "BT", "Подключено! Настройка протокола Nissan CAN...");
 
       _connection!.input!.listen(_onDataReceived).onDone(() {
         setState(() {
           _isConnected = false;
+          _isPollingLoopRunning = false;
         });
-        _pollingTimer?.cancel();
+        if (_cmdCompleter != null && !_cmdCompleter!.isCompleted) {
+          _cmdCompleter!.complete("DISCONNECTED");
+        }
         _showPopupAlert(
           "Связь потеряна",
           "Bluetooth-соединение с адаптером ELM327 было разорвано.",
@@ -280,7 +284,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       });
 
       await _initElm327();
-      _startCanPolling();
+      _runSequentialCanLoop();
     } catch (e, stack) {
       _showPopupAlert(
         "Ошибка подключения Bluetooth",
@@ -290,69 +294,40 @@ class _DashboardScreenState extends State<DashboardScreen> {
     }
   }
 
-  Future<void> _sendCommand(String cmd, {int delayMs = 110, String ecuTag = "ELM"}) async {
-    if (_connection != null && _isConnected) {
-      try {
-        _currentTargetEcu = ecuTag;
-        _telemetry.txCount++;
-        _addDevLog("TX ->", ecuTag, cmd);
-        _connection!.output.add(Uint8List.fromList(utf8.encode("$cmd\r")));
-        await _connection!.output.allSent;
-        await Future.delayed(Duration(milliseconds: delayMs));
-      } catch (e) {
-        _addDevLog("ERR", ecuTag, "Ошибка отправки '$cmd': $e");
-      }
+  // Отправка команды со СТРОГИМ ожиданием промпта '>' от ELM327 (никаких STOPPED!)
+  Future<String> _sendAndWait(String cmd, {String ecuTag = "ELM", int timeoutMs = 1500}) async {
+    if (_connection == null || !_isConnected) return "";
+
+    // Если предыдущая команда еще ждет — дожидаемся ее завершения
+    while (_cmdCompleter != null && !_cmdCompleter!.isCompleted) {
+      await Future.delayed(const Duration(milliseconds: 20));
+    }
+
+    _currentTargetEcu = ecuTag;
+    _cmdCompleter = Completer<String>();
+    _rxBuffer = "";
+
+    try {
+      _telemetry.txCount++;
+      _addDevLog("TX ->", ecuTag, cmd);
+      _connection!.output.add(Uint8List.fromList(utf8.encode("$cmd\r")));
+      await _connection!.output.allSent;
+
+      final String resp = await _cmdCompleter!.future.timeout(
+        Duration(milliseconds: timeoutMs),
+        onTimeout: () {
+          _addDevLog("ERR", ecuTag, "TIMEOUT ($cmd)");
+          return "TIMEOUT";
+        },
+      );
+      // Пауза 15 мс после '>', чтобы чип ELM327 успел переключить буфер UART
+      await Future.delayed(const Duration(milliseconds: 15));
+      return resp;
+    } catch (e) {
+      _addDevLog("ERR", ecuTag, "Ошибка отправки '$cmd': $e");
+      return "ERROR";
     }
   }
-
-  Future<void> _initElm327() async {
-    await _sendCommand("AT Z", delayMs: 500, ecuTag: "INIT");
-    await _sendCommand("AT E0", ecuTag: "INIT");
-    await _sendCommand("AT L0", ecuTag: "INIT");
-    await _sendCommand("AT S0", ecuTag: "INIT");
-    await _sendCommand("AT H0", ecuTag: "INIT");
-    await _sendCommand("AT SP 6", ecuTag: "INIT"); // ISO 15765-4 CAN (11 bit ID, 500 kbaud)
-  }
-
-  // ==================== ЦИКЛ ОПРОСА БЛОКОВ NISSAN X-TRAIL T31 ====================
-
-  void _startCanPolling() {
-    _pollingTimer?.cancel();
-    _pollingTimer = Timer.periodic(const Duration(milliseconds: 250), (timer) async {
-      if (!_isConnected || _pausePollingForManualCmd) return;
-
-      switch (_pollStep) {
-        case 0:
-          // Опрос блока ABS (740 -> 760)
-          await _sendCommand("AT SH 740", delayMs: 40, ecuTag: "ABS");
-          await _sendCommand("AT CRA 760", delayMs: 40, ecuTag: "ABS");
-          await _sendCommand("2101", delayMs: 90, ecuTag: "ABS");
-          break;
-        case 1:
-          // Опрос блока полного привода 4WD (743 -> 763)
-          await _sendCommand("AT SH 743", delayMs: 40, ecuTag: "4WD");
-          await _sendCommand("AT CRA 763", delayMs: 40, ecuTag: "4WD");
-          await _sendCommand("2101", delayMs: 90, ecuTag: "4WD");
-          break;
-        case 2:
-          // Повторный опрос ABS для высокой частоты детекции букса
-          await _sendCommand("AT SH 740", delayMs: 40, ecuTag: "ABS");
-          await _sendCommand("AT CRA 760", delayMs: 40, ecuTag: "ABS");
-          await _sendCommand("2101", delayMs: 90, ecuTag: "ABS");
-          break;
-        case 3:
-          // Опрос вариатора Jatco JF011E (7E1 -> 7E9)
-          await _sendCommand("AT SH 7E1", delayMs: 40, ecuTag: "CVT");
-          await _sendCommand("AT CRA 7E9", delayMs: 40, ecuTag: "CVT");
-          await _sendCommand("2101", delayMs: 90, ecuTag: "CVT");
-          break;
-      }
-
-      _pollStep = (_pollStep + 1) % 4;
-    });
-  }
-
-  // ==================== ПАРСИНГ ОТВЕТОВ И МАТЕМАТИКА ====================
 
   void _onDataReceived(Uint8List data) {
     _rxBuffer += ascii.decode(data, allowInvalid: true);
@@ -366,23 +341,155 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
       _telemetry.rxCount++;
       _addDevLog("RX <-", _currentTargetEcu, rawResponse.isEmpty ? "EMPTY" : rawResponse);
-      _parseCanFrame(rawResponse, _currentTargetEcu);
+
+      if (_cmdCompleter != null && !_cmdCompleter!.isCompleted) {
+        _cmdCompleter!.complete(rawResponse);
+      }
     }
   }
 
-  void _parseCanFrame(String rawStr, String ecuTag) {
-    if (rawStr.isEmpty) return;
-    if (rawStr.contains("NO DATA") || rawStr.contains("ERROR") || rawStr.contains("?")) {
+  Future<void> _initElm327() async {
+    // Даем адаптеру полноценно перезагрузиться после AT Z
+    await _sendAndWait("AT Z", ecuTag: "INIT", timeoutMs: 2500);
+    await Future.delayed(const Duration(milliseconds: 300));
+    await _sendAndWait("AT E0", ecuTag: "INIT");   // Отключить эхо команд
+    await _sendAndWait("AT L0", ecuTag: "INIT");   // Отключить переводы строк
+    await _sendAndWait("AT S0", ecuTag: "INIT");   // Без пробелов (быстрее передача)
+    await _sendAndWait("AT H0", ecuTag: "INIT");   // Скрыть заголовки CAN
+    await _sendAndWait("AT CAF1", ecuTag: "INIT"); // Включить автоформатирование ISO-TP
+    await _sendAndWait("AT SP 6", ecuTag: "INIT"); // CAN 11bit 500kbps
+    await _sendAndWait("AT ST 32", ecuTag: "INIT");// Таймаут ожидания ответа ~200 мс
+  }
+
+  // Настройка адресации ЭБУ + аппаратного Flow Control для многострочных ответов Nissan
+  Future<void> _selectEcu(String txHeader, String rxFilter, String ecuTag) async {
+    await _sendAndWait("AT SH $txHeader", ecuTag: ecuTag);
+    await _sendAndWait("AT CRA $rxFilter", ecuTag: ecuTag);
+    await _sendAndWait("AT FCSH $txHeader", ecuTag: ecuTag);
+    await _sendAndWait("AT FCSD 300000", ecuTag: ecuTag); // Разрешить прием всех фреймов без задержки
+    await _sendAndWait("AT FCSM 1", ecuTag: ecuTag);      // Включить кастомный Flow Control
+  }
+
+  // ==================== ПОСЛЕДОВАТЕЛЬНЫЙ ЦИКЛ ОПРОСА БЛОКОВ ====================
+
+  Future<void> _runSequentialCanLoop() async {
+    if (_isPollingLoopRunning) return;
+    _isPollingLoopRunning = true;
+
+    while (_isConnected && _isPollingLoopRunning) {
+      if (_pausePollingForManualCmd) {
+        await Future.delayed(const Duration(milliseconds: 100));
+        continue;
+      }
+
+      // 1. БЛОК ABS (740 -> 760)
+      // Твой блок ABS ответил 7F 21 12 на 2101, поэтому пробуем 221101..04 (скорости колес UDS) и 2102
+      await _selectEcu("740", "760", "ABS");
+      await _sendAndWait("10C0", ecuTag: "ABS"); // Диагностическая сессия Nissan
+      final String absFL = await _sendAndWait("221101", ecuTag: "ABS");
+      final String absFR = await _sendAndWait("221102", ecuTag: "ABS");
+      final String absRL = await _sendAndWait("221103", ecuTag: "ABS");
+      final String absRR = await _sendAndWait("221104", ecuTag: "ABS");
+      _parseAbsIndividualPids(absFL, absFR, absRL, absRR);
+
+      if (!_isConnected || !_isPollingLoopRunning) break;
+
+      // 2. БЛОК ПОЛНОГО ПРИВОДА 4WD (743 -> 763)
+      // В твоем логе он отлично отдал 0: 61 01 ..., теперь с Flow Control он отдаст весь пакет!
+      await _selectEcu("743", "763", "4WD");
+      final String awdResp = await _sendAndWait("2101", ecuTag: "4WD");
+      _parseMultiFrameResponse(awdResp, "4WD");
+
+      if (!_isConnected || !_isPollingLoopRunning) break;
+
+      // 3. БЛОК ВАРИАТОРА JF011E (7E1 -> 7E9)
+      await _selectEcu("7E1", "7E9", "CVT");
+      final String cvtResp = await _sendAndWait("2101", ecuTag: "CVT");
+      _parseMultiFrameResponse(cvtResp, "CVT");
+
+      await Future.delayed(const Duration(milliseconds: 40));
+    }
+  }
+
+  // ==================== ПАРСИНГ ОТВЕТОВ NISSAN T31 ====================
+
+  // Парсинг индивидуальных PID скоростей колес ABS (62 11 01 XX YY)
+  void _parseAbsIndividualPids(String fl, String fr, String rl, String rr) {
+    setState(() {
+      _telemetry.lastRawAbs = "FL:$fl | FR:$fr | RL:$rl | RR:$rr";
+
+      final bFL = _extractResponseAfterHeader(fl, 0x62, 0x11);
+      final bFR = _extractResponseAfterHeader(fr, 0x62, 0x11);
+      final bRL = _extractResponseAfterHeader(rl, 0x62, 0x11);
+      final bRR = _extractResponseAfterHeader(rr, 0x62, 0x11);
+
+      _telemetry.lastBytesAbs = [...bFL, ...bFR, ...bRL, ...bRR];
+
+      if (bFL.length >= 4) _telemetry.speedFL = _decodeWheelSpeed(bFL.sublist(3));
+      if (bFR.length >= 4) _telemetry.speedFR = _decodeWheelSpeed(bFR.sublist(3));
+      if (bRL.length >= 4) _telemetry.speedRL = _decodeWheelSpeed(bRL.sublist(3));
+      if (bRR.length >= 4) _telemetry.speedRR = _decodeWheelSpeed(bRR.sublist(3));
+
+      _calculateSlipAndVirtualTpms();
+    });
+  }
+
+  double _decodeWheelSpeed(List<int> valBytes) {
+    if (valBytes.length >= 2) {
+      int raw = (valBytes[0] << 8) + valBytes[1];
+      // Если значение большое — значит передается в сотых долях км/ч, иначе в целых/десятых
+      return raw > 300 ? raw / 100.0 : raw.toDouble();
+    } else if (valBytes.length == 1) {
+      return valBytes[0].toDouble();
+    }
+    return 0.0;
+  }
+
+  List<int> _extractResponseAfterHeader(String raw, int b0, int b1) {
+    if (raw.contains("7F") || raw.contains("NO DATA") || raw.contains("ERR")) {
       _telemetry.errCount++;
+      return [];
+    }
+    final clean = _stripIsoTpFraming(raw);
+    final bytes = _hexToBytes(clean);
+    for (int i = 0; i < bytes.length - 1; i++) {
+      if (bytes[i] == b0 && bytes[i + 1] == b1) {
+        return bytes.sublist(i);
+      }
+    }
+    return [];
+  }
+
+  // Очистка многострочного ответа ISO-TP от маркеров строк "0:", "1:", "2:" и байта длины "064"
+  String _stripIsoTpFraming(String rawStr) {
+    // Разбиваем по пробелам и убираем токены вида "0:", "1:", а также 3-символьные длины вроде "064"
+    final tokens = rawStr.split(RegExp(r'\s+'));
+    final StringBuffer hexBuf = StringBuffer();
+    for (final t in tokens) {
+      if (t.isEmpty) continue;
+      if (RegExp(r'^[0-9A-Fa-f]:$').hasMatch(t)) continue; // Маркер кадра "0:"
+      if (t.length == 3 && RegExp(r'^[0-9A-Fa-f]{3}$').hasMatch(t)) continue; // Длина "064"
+      // Если строка склеена без пробелов (при AT S0), вырезаем "0:", "1:" регуляркой
+      String cleanedToken = t.replaceAll(RegExp(r'[0-9A-Fa-f]:'), '');
+      hexBuf.write(cleanedToken);
+    }
+    return hexBuf.toString();
+  }
+
+  void _parseMultiFrameResponse(String rawStr, String ecuTag) {
+    if (rawStr.isEmpty) return;
+    if (rawStr.contains("NO DATA") || rawStr.contains("ERROR") || rawStr.contains("7F")) {
+      _telemetry.errCount++;
+      setState(() {
+        if (ecuTag == "4WD") _telemetry.lastRawAwd = rawStr;
+        if (ecuTag == "CVT") _telemetry.lastRawCvt = rawStr;
+      });
       return;
     }
 
-    // Очищаем пробелы и префиксы многокадровых ответов ISO-TP (0:, 1:, 2: и первого кадра длины)
-    final String noSpaces = rawStr.replaceAll(" ", "");
-    final String cleanHex = noSpaces.replaceAll(RegExp(r'[0-9A-F]:'), '');
+    final String cleanHex = _stripIsoTpFraming(rawStr);
     final List<int> bytes = _hexToBytes(cleanHex);
 
-    // Ищем начало позитивного ответа 61 01 (0x61, 0x01) в массиве байтов
     int startIdx = -1;
     for (int i = 0; i < bytes.length - 1; i++) {
       if (bytes[i] == 0x61 && bytes[i + 1] == 0x01) {
@@ -395,11 +502,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final List<int> payload = bytes.sublist(startIdx);
 
     setState(() {
-      if (ecuTag == "ABS") {
-        _telemetry.lastRawAbs = rawStr;
-        _telemetry.lastBytesAbs = payload;
-        _parseAbsData(payload);
-      } else if (ecuTag == "4WD") {
+      if (ecuTag == "4WD") {
         _telemetry.lastRawAwd = rawStr;
         _telemetry.lastBytesAwd = payload;
         _parseAwdData(payload);
@@ -412,19 +515,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
     });
   }
 
-  void _parseAbsData(List<int> b) {
-    if (b.length >= 10) {
-      _telemetry.speedFL = ((b[2] << 8) + b[3]) / 100.0;
-      _telemetry.speedFR = ((b[4] << 8) + b[5]) / 100.0;
-      _telemetry.speedRL = ((b[6] << 8) + b[7]) / 100.0;
-      _telemetry.speedRR = ((b[8] << 8) + b[9]) / 100.0;
-    }
-  }
-
   void _parseAwdData(List<int> b) {
+    // На T31 в пакете 61 01 от блока 4WD (743) также часто дублируются скорости всех 4 колес!
     if (b.length >= 6) {
       int currentMa = (b[2] << 8) + b[3];
-      _telemetry.awdSolenoidCurrent = currentMa / 1000.0;
+      _telemetry.awdSolenoidCurrent = (currentMa / 1000.0).clamp(0.0, 3.5);
       _telemetry.awdTorqueSplitRear =
           ((_telemetry.awdSolenoidCurrent / 2.8) * 50).clamp(0, 50).round();
 
@@ -496,8 +591,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   List<int> _hexToBytes(String hex) {
     List<int> bytes = [];
-    for (int i = 0; i + 1 < hex.length; i += 2) {
-      final part = hex.substring(i, i + 2);
+    final clean = hex.replaceAll(RegExp(r'[^0-9A-Fa-f]'), '');
+    for (int i = 0; i + 1 < clean.length; i += 2) {
+      final part = clean.substring(i, i + 2);
       final val = int.tryParse(part, radix: 16);
       if (val != null) bytes.add(val);
     }
@@ -507,30 +603,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
   // ==================== СИМУЛЯТОР (ДЕМО-РЕЖИМ) ====================
 
   void _toggleDemoMode() {
-    _pollingTimer?.cancel();
+    _demoTimer?.cancel();
     setState(() {
       _isDemoMode = !_isDemoMode;
     });
 
     if (_isDemoMode) {
-      _addDevLog("SYS", "DEMO", "Запущен демо-режим (симуляция CAN пакетов)");
+      _addDevLog("SYS", "DEMO", "Запущен демо-режим");
       int tick = 0;
-      _pollingTimer = Timer.periodic(const Duration(milliseconds: 350), (t) {
+      _demoTimer = Timer.periodic(const Duration(milliseconds: 350), (t) {
         tick++;
         bool simulateSlip = (tick % 20) < 6;
 
-        // Генерируем правдоподобные сырые ответы для проверки меню разработчика
-        _parseCanFrame(
-          simulateSlip
-              ? "61 01 1A C2 17 70 17 70 17 8C"
-              : "61 01 17 70 17 70 17 70 17 8C",
-          "ABS",
+        _parseAbsIndividualPids(
+          simulateSlip ? "6211011AC2" : "6211011770",
+          "6211021770",
+          "6211031770",
+          "621104178C",
         );
-        _parseCanFrame(
-          simulateSlip ? "61 01 09 60 01 00" : "61 01 00 C8 01 00",
+        _parseMultiFrameResponse(
+          simulateSlip ? "610109600100" : "610100C80100",
           "4WD",
         );
-        _parseCanFrame("61 01 00 00 00 00 00 00 00 00 84 00", "CVT");
+        _parseMultiFrameResponse("610100000000000000008400", "CVT");
       });
     } else {
       _addDevLog("SYS", "DEMO", "Демо-режим остановлен");
@@ -551,8 +646,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  // ==================== ОТКРЫТИЕ МЕНЮ РАЗРАБОТЧИКА ====================
-
   void _openDeveloperMenu() {
     Navigator.of(context).push(
       MaterialPageRoute(
@@ -563,8 +656,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           isConnected: _isConnected,
           onSendManualCommand: (String cmd) async {
             _pausePollingForManualCmd = true;
-            await Future.delayed(const Duration(milliseconds: 150));
-            await _sendCommand(cmd, delayMs: 250, ecuTag: "MANUAL");
+            await _sendAndWait(cmd, ecuTag: "MANUAL", timeoutMs: 2000);
             _pausePollingForManualCmd = false;
           },
           onClearLogs: () {
@@ -932,34 +1024,37 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
 
   void _copyAllTelemetryReport() {
     final StringBuffer sb = StringBuffer();
-    sb.writeln("=== X-TRAIL T31 DIAGNOSTIC REPORT (by denmov) ===");
+    sb.writeln("=== X-TRAIL T31 DIAGNOSTIC REPORT v2 (by denmov) ===");
     sb.writeln("TX: ${widget.telemetry.txCount} | RX: ${widget.telemetry.rxCount} | ERR: ${widget.telemetry.errCount}");
     sb.writeln("\n--- СНИМКИ БЛОКОВ (RAW HEX) ---");
     sb.writeln("ABS (740->760): ${widget.telemetry.lastRawAbs}");
+    sb.writeln("ABS BYTES: ${_formatIndexedBytes(widget.telemetry.lastBytesAbs)}");
     sb.writeln("4WD (743->763): ${widget.telemetry.lastRawAwd}");
+    sb.writeln("4WD BYTES: ${_formatIndexedBytes(widget.telemetry.lastBytesAwd)}");
     sb.writeln("CVT (7E1->7E9): ${widget.telemetry.lastRawCvt}");
-    sb.writeln("\n--- ПОСЛЕДНИЕ 50 СТРОК ЛОГА ---");
-    for (final entry in widget.logs.take(50)) {
+    sb.writeln("CVT BYTES: ${_formatIndexedBytes(widget.telemetry.lastBytesCvt)}");
+    sb.writeln("\n--- ПОСЛЕДНИЕ 60 СТРОК ЛОГА ---");
+    for (final entry in widget.logs.take(60)) {
       sb.writeln(entry.toString());
     }
 
     Clipboard.setData(ClipboardData(text: sb.toString()));
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text("Полный отчет разработчика скопирован в буфер!"),
+        content: Text("Полный отчет разработчика v2 скопирован в буфер!"),
         duration: Duration(seconds: 2),
       ),
     );
   }
 
   String _formatIndexedBytes(List<int> bytes) {
-    if (bytes.isEmpty) return "Пусто (ожидание ответа 61 01...)";
+    if (bytes.isEmpty) return "Пусто";
     List<String> parts = [];
     for (int i = 0; i < bytes.length; i++) {
       final hex = bytes[i].toRadixString(16).toUpperCase().padLeft(2, '0');
       parts.add("[$i]:$hex(${bytes[i]})");
     }
-    return parts.join("  ");
+    return parts.join(" ");
   }
 
   @override
@@ -967,7 +1062,7 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
     return Scaffold(
       appBar: AppBar(
         backgroundColor: const Color(0xFF1A1F29),
-        title: const Text("Меню разработчика", style: TextStyle(fontSize: 16)),
+        title: const Text("Меню разработчика v2", style: TextStyle(fontSize: 16)),
         actions: [
           IconButton(
             tooltip: "Скопировать весь отчет для Gemini",
@@ -1006,7 +1101,6 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
     );
   }
 
-  // Вкладка 1: Раскладка байтов по каждому блоку для быстрой правки формул
   Widget _buildEcuSnapshotTab() {
     return ListView(
       padding: const EdgeInsets.all(12),
@@ -1019,38 +1113,38 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
               children: [
                 _buildCounterItem("Отправлено (TX)", widget.telemetry.txCount, Colors.cyanAccent),
                 _buildCounterItem("Принято (RX)", widget.telemetry.rxCount, Colors.greenAccent),
-                _buildCounterItem("Ошибки/NO DATA", widget.telemetry.errCount, Colors.redAccent),
+                _buildCounterItem("Ошибки/7F", widget.telemetry.errCount, Colors.redAccent),
               ],
             ),
           ),
         ),
         const SizedBox(height: 8),
         _buildEcuDebugCard(
-          title: "Блок ABS (740 -> 760) | Запрос: 2101",
+          title: "Блок ABS (740 -> 760) | Запросы: 221101..04",
           rawHex: widget.telemetry.lastRawAbs,
           indexedBytes: _formatIndexedBytes(widget.telemetry.lastBytesAbs),
           parsedSummary:
               "FL: ${widget.telemetry.speedFL} км/ч | FR: ${widget.telemetry.speedFR} км/ч\n"
               "RL: ${widget.telemetry.speedRL} км/ч | RR: ${widget.telemetry.speedRR} км/ч",
-          formulaNote: "Сейчас формула берет байты [2..3], [4..5], [6..7], [8..9] и делит на 100.",
+          formulaNote: "Опрос по UDS сервису 22 (так как 2101 вернул 7F 21 12).",
         ),
         const SizedBox(height: 8),
         _buildEcuDebugCard(
-          title: "Блок 4WD (743 -> 763) | Запрос: 2101",
+          title: "Блок 4WD (743 -> 763) | Запрос: 2101 + FlowControl",
           rawHex: widget.telemetry.lastRawAwd,
           indexedBytes: _formatIndexedBytes(widget.telemetry.lastBytesAwd),
           parsedSummary:
               "Режим: ${widget.telemetry.awdMode} | Ток муфты: ${widget.telemetry.awdSolenoidCurrent} А\n"
               "Момент назад: ${widget.telemetry.awdTorqueSplitRear}%",
-          formulaNote: "Сейчас ток берется из [2..3] (мА), режим шайбы из [4].",
+          formulaNote: "С полной выгрузкой многострочного ответа 064 байт.",
         ),
         const SizedBox(height: 8),
         _buildEcuDebugCard(
-          title: "Вариатор Jatco JF011E (7E1 -> 7E9) | Запрос: 2101",
+          title: "Вариатор Jatco JF011E (7E1 -> 7E9) | Запрос: 2101 + FlowControl",
           rawHex: widget.telemetry.lastRawCvt,
           indexedBytes: _formatIndexedBytes(widget.telemetry.lastBytesCvt),
           parsedSummary: "Температура CVT: ${widget.telemetry.cvtTemp} °C",
-          formulaNote: "Сейчас берется байт [10] - 50.",
+          formulaNote: "С полной выгрузкой всех фреймов TCM.",
         ),
       ],
     );
@@ -1093,14 +1187,14 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
             const Text("Сырой ответ адаптера:", style: TextStyle(fontSize: 11, color: Colors.white54)),
             SelectableText(
               rawHex,
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 13, color: Colors.greenAccent),
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.greenAccent),
             ),
             const SizedBox(height: 6),
             const Text("Раскладка по индексам [индекс]:HEX(DEC):",
                 style: TextStyle(fontSize: 11, color: Colors.white54)),
             SelectableText(
               indexedBytes,
-              style: const TextStyle(fontFamily: 'monospace', fontSize: 12, color: Colors.white),
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11, color: Colors.white),
             ),
             const SizedBox(height: 6),
             Text(
@@ -1115,7 +1209,6 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
     );
   }
 
-  // Вкладка 2: Живой журнал пакетов
   Widget _buildLiveLogTab() {
     return Column(
       children: [
@@ -1168,7 +1261,6 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
     );
   }
 
-  // Вкладка 3: Ручной терминал команд ELM327
   Widget _buildTerminalTab() {
     return Padding(
       padding: const EdgeInsets.all(12.0),
@@ -1186,12 +1278,11 @@ class _DeveloperMenuScreenState extends State<DeveloperMenuScreen>
             children: [
               _buildQuickCmdChip("Версия ELM (AT I)", "AT I"),
               _buildQuickCmdChip("Напряжение (AT RV)", "AT RV"),
-              _buildQuickCmdChip("Протокол (AT DP)", "AT DP"),
-              _buildQuickCmdChip("Шина ABS (AT SH 740)", "AT SH 740"),
-              _buildQuickCmdChip("Шина 4WD (AT SH 743)", "AT SH 743"),
-              _buildQuickCmdChip("Шина CVT (AT SH 7E1)", "AT SH 7E1"),
-              _buildQuickCmdChip("Запрос 2101", "2101"),
-              _buildQuickCmdChip("Запрос 221101", "221101"),
+              _buildQuickCmdChip("ABS Сессия (10C0)", "10C0"),
+              _buildQuickCmdChip("ABS 221101", "221101"),
+              _buildQuickCmdChip("ABS 2102", "2102"),
+              _buildQuickCmdChip("CVT 2101", "2101"),
+              _buildQuickCmdChip("CVT 221103", "221103"),
             ],
           ),
           const SizedBox(height: 12),
